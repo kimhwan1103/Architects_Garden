@@ -8,5 +8,10 @@ contextBridge.exposeInMainWorld('api', {
         };
         ipcRenderer.on('notes-changed', listener);
         return () => ipcRenderer.removeListener('notes-changed', listener);
-    }
+    },
+    saveSvgAsPng: (args /* { svgString, defaultPath?: string, scale?: number } */) =>
+        ipcRenderer.invoke('save-svg-as-png', args),
+
+    saveBytes: (args /* { dataBase64, defaultPath?: string, mime?: string } */) =>
+        ipcRenderer.invoke('save-bytes', args),
 });

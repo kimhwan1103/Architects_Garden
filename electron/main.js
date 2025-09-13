@@ -1,10 +1,12 @@
 // electron/main.js — 백그라운드(트레이) & 핫키 복귀 최종본
-const { app, BrowserWindow, globalShortcut, dialog, Tray, Menu, nativeImage } = require('electron');
+const { app, BrowserWindow, globalShortcut, dialog, Tray, Menu, nativeImage, ipcMain } = require('electron');
 const path = require('path');
 const { spawn, spawnSync } = require('child_process');
 const http = require('http');
 const fs = require('fs');
 const chokidar = require('chokidar');
+const { error } = require('console');
+const sharp = require('sharp');
 
 let win = null;
 let tray = null;
@@ -28,6 +30,7 @@ function startPython() {
     ['-m', 'uvicorn', 'app:app', '--host', '127.0.0.1', '--port', String(API_PORT)],
     {
       cwd: ROOT_DIR,
+      env: { ...process.env },
       stdio: 'ignore',
       windowsHide: true,
       shell: false,
@@ -106,6 +109,56 @@ function watchNoteDir() {
     watcher.on('change', broadcast);
     watcher.on('unlink', broadcast);
 }
+
+//-------------------------------------------------------------
+// SVG → PNG 변환 후 저장
+//   args: { svgString: string, defaultPath?: string, scale?: number }
+//-------------------------------------------------------------
+ipcMain.handle('save-svg-as-png', async (event, { svgString, defaultPath = 'mindmap.png', scale = 2 }) => {
+  try {
+    const { filePath, canceled } = await dialog.showSaveDialog({
+      defaultPath,
+      filters: [{ name: 'PNG Image', extensions: ['png'] }]
+    });
+    if (canceled || !filePath) return { ok: false };
+
+    // density 로 해상도 제어 : 기본 72dpi → 72 * scale
+    const pngBuffer = await sharp(Buffer.from(svgString), { density: 72 * scale })
+      .png({ compressionLevel: 9 })
+      .toBuffer();
+
+    await fs.promises.writeFile(filePath, pngBuffer);
+    return { ok: true, filePath };
+  } catch (e) {
+    console.error('save-svg-as-png error:', e);
+    return { ok: false, error: String(e) };
+  }
+});
+
+//-------------------------------------------------------------
+// 단순 바이트(예: SVG 문자열 base64) 저장
+//   args: { dataBase64: string, defaultPath?: string, mime?: string }
+//-------------------------------------------------------------
+ipcMain.handle('save-bytes', async (event, { dataBase64, defaultPath = 'file.bin', mime = '' }) => {
+  try {
+    const { filePath, canceled } = await dialog.showSaveDialog({
+      defaultPath,
+      filters: [
+        mime.includes('svg') ? { name: 'SVG Image', extensions: ['svg'] } :
+        mime.includes('png') ? { name: 'PNG Image', extensions: ['png'] } :
+        { name: 'All Files', extensions: ['*'] }
+      ]
+    });
+    if (canceled || !filePath) return { ok: false };
+
+    const buffer = Buffer.from(dataBase64, 'base64');
+    await fs.promises.writeFile(filePath, buffer);
+    return { ok: true, filePath };
+  } catch (e) {
+    console.error('save-bytes error:', e);
+    return { ok: false, error: String(e) };
+  }
+});
 
 // --- 창 / 트레이 / 핫키 -------------------------------------------------------
 function toggleWindow() {

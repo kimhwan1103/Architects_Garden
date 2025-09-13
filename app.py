@@ -5,6 +5,16 @@ from typing import List, Optional
 from datetime import datetime, timezone
 from pathlib import Path
 import json, uuid
+import os
+
+from dotenv import load_dotenv
+ROOT = Path(__file__).parent.resolve()
+load_dotenv(ROOT / ".env")
+
+#langchain 관련 임포트
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import JsonOutputParser
+from  langchain_google_genai import ChatGoogleGenerativeAI
 
 ROOT = Path(__file__).parent.resolve()
 DATA_DIR = ROOT / "data" / "notes"
@@ -21,6 +31,10 @@ app.add_middleware(
     allow_headers=["*"]
 )
 
+@app.get("/api/health")
+def health():
+    return {"status": "ok", "time": datetime.now(timezone.utc).isoformat()}
+
 class NoteIn(BaseModel):
     title: str = Field(..., min_length=1, max_length=200)
     content: str = ""
@@ -30,6 +44,131 @@ class NoteOut(NoteIn):
     id: str
     created_at: str
     updated_at: str
+
+class Task(BaseModel):
+    id: str
+    title: str
+    details: Optional[str] = ""
+    depends_on: List[str] = []
+    estimate_hours: Optional[float] = None
+
+class Goal(BaseModel):
+    id: str
+    title: str
+    rationale: Optional[str] = ""
+    tasks: List[Task] = Field(default_factory=list)
+
+class AnalyzeIn(BaseModel):
+    title: str
+    content: str
+
+class AnalyzeOut(BaseModel):
+    summary: str
+    goals: List[Goal]
+    mermaid: str
+
+def _get_llm():
+    api_key = os.getenv("GOOGLE_API_KEY")
+    if not api_key:
+        raise RuntimeError("GOOGLE_API_KEY 환경변수를 설정하세요")
+    
+    return ChatGoogleGenerativeAI(
+        model="gemini-2.5-flash",
+        temperature=0.2,
+        max_output_tokens=None,
+        convert_system_message_to_prompt=True,
+    )
+
+ANALYZE_PROMPT = ChatPromptTemplate.from_messages([
+    ("system",
+     "You are an expert project analyst. Given a free-form note (KR/EN), extract:\n"
+     "1) concise summary (<=120 chars)\n"
+     "2) 3-6 intermediate goals\n"
+     "3) 2-6 actionable tasks per goal (imperative, <=80 chars)\n"
+     "4) Output note content for korean."
+     "Return STRICT JSON ONLY with schema:\n"
+     "```json\n"
+     "{{\n"
+     '  "summary": "string",\n'
+     '  "goals": [\n'
+     "    {{\n"
+     '      "id": "G1",\n'
+     '      "title": "string",\n'
+     '      "rationale": "string",\n'
+     '      "tasks": [\n'
+     '        {{"id":"T1","title":"string","details":"string","depends_on":[],"estimate_hours":1.5}}\n'
+     "      ]\n"
+     "    }}\n"
+     "  ]\n"
+     "}}\n"
+     "```\n"
+     "Use IDs like G1,G2 and T1,T2. No commentary."
+    ),
+    ("user",
+     "Title: {title}\n"
+     "Note:\n{content}\n"
+     "Output JSON ONLY.")
+])
+
+_parser = JsonOutputParser()
+
+#마인드맵 생성
+def _to_mermaid(goals: List[Goal]) -> str:
+    lines = ["graph TD", '  ROOT["Note Analysis"]:::root']
+    styles = [
+        "classDef root fill:#eef,stroke:#669,stroke-width:1px,color:#000",
+        "classDef goal fill:#efe,stroke:#393,stroke-width:1px,color:#000",
+        "classDef task fill:#ffe,stroke:#aa0,stroke-width:1px,color:#000",
+    ]
+    used_ids = set()
+    used_tasks = set()
+
+    for g in goals:
+        gid = g.id or f"G{len(used_ids)+1}"
+        if gid in used_ids:
+            gid = f"{gid}_{len(used_ids)+1}"
+        used_ids.add(gid)
+        title = (g.title or "").replace('"', "'")
+        lines.append(f'  ROOT --> {gid}["{title}"]:::goal')
+
+        for t in g.tasks:
+            tid = t.id or f"T{len(used_tasks)+1}"
+            if tid in used_tasks:
+                tid = f"{tid}_{len(used_tasks)+1}"
+            used_tasks.add(tid)
+            ttitle = (t.title or "").replace('"', "'")
+            lines.append(f'  {gid} --> {tid}["{ttitle}"]:::task')
+            for dep in t.depends_on or []:
+                lines.append(f'  {dep} --> {tid}')
+
+    lines.extend(styles)
+    return "\n".join(lines)
+
+@app.post("/api/analyze", response_model=AnalyzeOut)
+def analyze_note(payload: AnalyzeIn):
+    try:
+        llm = _get_llm()
+        chain = ANALYZE_PROMPT | llm | _parser
+
+        raw = chain.invoke({"title": payload.title, "content": payload.content})
+        goals: List[Goal] = []
+        for g in raw.get("goals", []):
+            tasks = [Task(**t) for t in g.get("tasks", [])]
+            goals.append(Goal(
+                id=str(g.get("id") or ""),
+                title=str(g.get("title") or ""),
+                rationale=str(g.get("rationale") or ""),
+                tasks=tasks
+            ))
+        summary = str(raw.get("summary") or "")[:120]
+        mermaid = _to_mermaid(goals)
+        return AnalyzeOut(summary=summary, goals=goals, mermaid=mermaid)
+    except Exception as e:
+        return AnalyzeOut(
+            summary="분석 실패: " + str(e)[:100],
+            goals=[],
+            mermaid="graph TD\n ROOT[Error]\n"
+        )
 
 def _p(note_id: str) -> Path: return DATA_DIR / f"{note_id}.json"
 

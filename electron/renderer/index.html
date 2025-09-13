@@ -28,11 +28,19 @@
     .toastui-editor-defaultUI{ height:100%; }
     .toastui-editor-main{ height:calc(100% - 44px); } /* toolbar 제외 */
     .toastui-editor-contents{ font-size:15px; line-height:1.6; }
+    /* 분석 결과 리스트 */
+    #analysisGoals ul{ margin:6px 0 0 18px; padding:0; }
+    #analysisGoals li{ margin:2px 0; }
   </style>
 
   <!-- Toast UI Editor (CDN) -->
   <link rel="stylesheet" href="https://uicdn.toast.com/editor/latest/toastui-editor.min.css" />
+  <script src="https://cdn.jsdelivr.net/npm/svg-pan-zoom@3.6.1/dist/svg-pan-zoom.min.js"></script>
   <script src="https://uicdn.toast.com/editor/latest/toastui-editor-all.min.js"></script>
+
+  <!-- Mermaid (마인드맵 렌더) -->
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+  <script> mermaid.initialize({ startOnLoad:false, theme:'default' }); </script>
 </head>
 <body>
   <div class="layout">
@@ -52,10 +60,12 @@
       <div class="list" id="noteList"></div>
     </aside>
 
-    <!-- 가운데: 편집기(동일 창에서 라이브 렌더) -->
+    <!-- 가운데: 편집기 -->
     <main class="panel editor">
       <div class="row" style="gap:6px;">
         <input id="title" type="text" placeholder="제목" style="flex:1;" />
+        <!-- ✅ AI 분석 버튼 추가 -->
+        <button class="btn" id="analyzeBtn">AI 분석</button>
         <button class="btn primary" id="saveBtn">저장</button>
       </div>
       <input id="tags" type="text" placeholder="태그: 쉼표로 구분" />
@@ -64,10 +74,31 @@
       <div class="muted" id="status">대기 중</div>
     </main>
 
-    <!-- 오른쪽: 어시스턴트 -->
+    <!-- 오른쪽: 어시스턴트 + 분석 결과 영역 추가 -->
     <aside class="panel">
       <h2 style="margin:0 0 8px 0;">어시스턴트</h2>
-      <div id="chatLog" style="border:1px solid var(--line); border-radius:8px; padding:8px; height:70%; overflow:auto"></div>
+
+      <!-- ✅ AI 분석 결과 영역 -->
+      <div style="margin-bottom:10px;">
+        <h3 style="margin:0 0 6px 0;">AI 분석 결과</h3>
+        <div id="analysisSummary" class="muted" style="margin-bottom:6px;"></div>
+        <div id="analysisGoals" style="font-size:14px; line-height:1.5;"></div>
+
+        <!-- ✅ 마인드맵 래퍼 + 툴바 -->
+        <div id="mindmapWrap" style="position:relative; border:1px solid var(--line); border-radius:8px; height:420px; overflow:hidden;">
+          <div class="mm-toolbar" style="position:absolute; right:8px; top:8px; display:flex; gap:6px; z-index:2;">
+            <button id="mmZoomIn"  class="btn" title="확대">＋</button>
+            <button id="mmZoomOut" class="btn" title="축소">－</button>
+            <button id="mmReset"   class="btn" title="리셋">⟳</button>
+            <button id="mmFit"     class="btn" title="맞춤">▣</button>
+            <button id="mmSaveSVG" class="btn" title="SVG 저장">SVG</button>
+            <button id="mmSavePNG" class="btn" title="PNG 저장">PNG</button>
+          </div>
+          <div id="mindmap" style="width:100%; height:100%;"></div>
+        </div>
+      </div>
+
+      <div id="chatLog" style="border:1px solid var(--line); border-radius:8px; padding:8px; height:38%; overflow:auto"></div>
       <div class="row" style="margin-top:8px;">
         <input id="chatInput" type="text" placeholder="질문을 입력하세요…" style="flex:1;" />
         <button class="btn primary" id="sendBtn">보내기</button>
@@ -86,6 +117,10 @@
     const qEl = $("#q"), searchBtn = $("#searchBtn");
     const newBtn = $("#newBtn"), delBtn = $("#delBtn");
     const titleEl = $("#title"), tagsEl = $("#tags"), saveBtn = $("#saveBtn"), statusEl = $("#status");
+    const analyzeBtn = $("#analyzeBtn");                        // ✅
+    const analysisSummaryEl = $("#analysisSummary");            // ✅
+    const analysisGoalsEl   = $("#analysisGoals");              // ✅
+    const mindmapEl         = $("#mindmap");                    // ✅
     const chatLogEl = $("#chatLog"), chatInputEl = $("#chatInput"),
           sendBtn = $("#sendBtn"), clearChatBtn = $("#clearChat");
 
@@ -94,6 +129,7 @@
     let notes = [];
     let chatHistory = [];
     let editor = null; // Toast UI Editor 인스턴스
+    let mmPan = null;
 
     const escapeHtml = s => (s ?? "").replace(/[&<>"']/g, m => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[m]));
     const debounce = (fn, ms=500) => { let t; return (...a)=>{ clearTimeout(t); t=setTimeout(()=>fn(...a), ms); }; };
@@ -103,8 +139,8 @@
       editor = new toastui.Editor({
         el: document.querySelector('#mdEditor'),
         height: '100%',
-        initialEditType: 'markdown',     // 같은 창에서 즉시 렌더
-        previewStyle: 'tab',             // 미리보기 탭 비활성 느낌 (WYSIWYG라 필요 없음)
+        initialEditType: 'markdown',   // 편집과 렌더를 한 화면에서
+        previewStyle: 'tab',
         usageStatistics: false,
         placeholder: '여기에 마크다운을 입력하세요…',
         toolbarItems: [
@@ -189,7 +225,6 @@
       await fetchList();
     }
     const autoSave = debounce(async ()=>{
-      // 제목/내용이 비어있지 않으면 자동 저장
       if (!currentId && (titleEl.value.trim() || getContent().trim())) { await createNote(); return; }
       if (currentId) { await saveNote(); }
     }, 1200);
@@ -200,6 +235,207 @@
       currentId = null; setEditor(null); statusEl.textContent = "삭제 완료";
       await fetchList();
     }
+
+    // ===== AI 분석 렌더링 =====
+    function renderAnalysis(result){
+    // 요약/목표 영역 먼저 렌더
+    analysisSummaryEl.textContent = result.summary || '';
+    if (Array.isArray(result.goals) && result.goals.length) {
+      const html = result.goals.map(g => {
+        const tasks = (g.tasks||[]).map(t => `<li>✅ ${escapeHtml(t.title||'')}</li>`).join("");
+        return `
+          <div style="margin:8px 0;">
+            <div><strong>🎯 ${escapeHtml(g.title||'')}</strong></div>
+            ${g.rationale ? `<div class="muted">${escapeHtml(g.rationale)}</div>` : ""}
+            <ul style="margin:6px 0 0 18px">${tasks}</ul>
+          </div>`;
+      }).join("");
+      analysisGoalsEl.innerHTML = html;
+    } else {
+      analysisGoalsEl.innerHTML = '<div class="muted">제안된 목표가 없습니다.</div>';
+    }
+
+    // Mermaid mindmap (한 번만 렌더)
+    mindmapEl.innerHTML = '';
+    const code = result.mermaid || 'graph TD\nROOT[Empty]';
+    const id = 'mm' + Math.random().toString(36).slice(2);
+
+    mermaid.render(id, code).then(({ svg }) => {
+      mindmapEl.innerHTML = svg;
+
+      // pan/zoom 적용
+      const svgEl = mindmapEl.querySelector('svg');
+      if (!svgEl) return;
+
+      if (mmPan) { try { mmPan.destroy(); } catch(e){} }
+
+      mmPan = svgPanZoom(svgEl, {
+        zoomEnabled: true,
+        panEnabled: true,
+        controlIconsEnabled: false,
+        fit: true,
+        center: true,
+        minZoom: 0.2,
+        maxZoom: 10,             // ← 충분히 크게
+        zoomScaleSensitivity: 0.2
+      });
+      if (mmPan.enableMouseWheelZoom) mmPan.enableMouseWheelZoom();
+
+      // 초기 맞춤
+      mmPan.resize();
+      mmPan.fit();
+      mmPan.center();
+    }).catch(err => {
+      console.error('mermaid render error', err);
+      mindmapEl.textContent = '마인드맵 렌더 오류';
+    });
+  }
+
+    document.getElementById('mmZoomIn').onclick  = () => mmPan && mmPan.zoomBy(1.2);
+    document.getElementById('mmZoomOut').onclick = () => mmPan && mmPan.zoomBy(0.8);
+    document.getElementById('mmReset').onclick   = () => {
+      if (!mmPan) return;
+      mmPan.zoom(1); mmPan.center();
+    };
+    document.getElementById('mmFit').onclick     = () => {
+      if (!mmPan) return;
+      mmPan.resize(); mmPan.fit(); mmPan.center();
+    };
+
+    // ✅ 창 리사이즈 시 자동 맞춤
+    window.addEventListener('resize', () => {
+      if (!mmPan) return;
+      mmPan.resize(); mmPan.fit(); mmPan.center();
+    });
+
+    const ipcRenderer = (window.require && window.require('electron'))
+      ? window.require('electron').ipcRenderer
+      : null;
+
+    //현재 화면의 Mermaid SVG를 문자열로 가져오기
+    function getMindmapSVGString() {
+      const svg = document.querySelector('#mindmap svg');
+      if (!svg) return null;
+
+      let { width, height } = svg.getBoundingClientRect();
+      const vb = svg.getAttribute('viewBox');
+      if ((!svg.getAttribute('width') || !svg.getAttribute('height')) && vb) {
+        const parts = vb.split(/\s+/).map(Number);
+        if (parts.length === 4) {
+          width = parts[2];
+          height = parts[3];
+        }
+      }
+      const clone = svg.cloneNode(true);
+      clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
+      if (width && height) {
+        clone.setAttribute('width', String(Math.round(width)));
+        clone.setAttribute('height', String(Math.round(height)));
+      }
+      const xml = new XMLSerializer().serializeToString(clone);
+      return `<?xml version="1.0" encoding="UTF-8"?>\n${xml}`;
+    }
+
+    //Anchor 다운로드 플백
+    function downloadBlobinPage(blob, filename = 'mindmap') {
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    }
+
+    //SVG 저장
+    async function exportMindmapSVG() {
+      const svgString = getMindmapSVGString();
+      if (!svgString) { alert('저장할 마인드맵이 없습니다.'); return;}
+      const blob = new Blob([svgString], { type: 'image/svg+xml;charset=utf-8'});
+
+      if (ipcRenderer) {
+        const base64 = btoa(unescape(encodeURIComponent(svgString)));
+        const res = await ipcRenderer.invoke('save-file', {
+          dataBase64 : base64,
+          defaultPath : 'mindmap.svg',
+          mime : 'image/svg+xml'
+        });
+        if (!res?.ok) alert('저장 취소 또는 실패');
+      } else {
+        downloadBlobinPage(blob, 'mindmap.svg');
+      }
+    }
+
+    //PNG 저장 (canvas로 래스터화; scale로 해상도 선택)
+    async function exportMindmapPNG(scale = 2) {
+      const svgString = getMindmapSVGString();
+      if (!svgString) { alert('저장할 마이든맵이 없습니다.'); return;}
+      
+      // data ULR -> load image
+      const svgBlob = new Blob([svgString], { type: 'image/svg+xml;charset=utf-8'});
+      const url = URL.createObjectURL(svgBlob);
+      const img = new Image();
+      img.onload = async () => {
+        const svg = document.querySelector('#mindmap svg');
+        let w = img.width, h = img.height;
+        if (svg) {
+          const vb = svg.getAttribute('viewBox');
+          if (vb) {
+            const parts = vb.split(/\s+/).map(Number);
+            if(parts.length === 4) {
+              w = parts[2];
+              h = parts[3];
+            }
+          }
+        }
+        w = Math.max(1, Math.round(img.width * scale));
+        h = Math.max(1, Math.round(img.height * scale));
+        const canvas = document.createElement('canvas');
+        canvas.width = w; canvas.height = h;
+        const ctx = canvas.getContext('2d');
+        ctx.setTransform(scale, 0, 0, scale, 0, 0);
+        ctx.drawImage(img, 0, 0);
+        URL.revokeObjectURL(url);
+
+        canvas.toBlob(async (blob) => {
+          if (!blob) { alert('PNG 변환 실패'); return; }
+          if (ipcRenderer) {
+            const buf = await blob.arrayBuffer();
+            // ArrayBuffer → base64
+            let binary = '';
+            const bytes = new Uint8Array(buf);
+            const len = bytes.byteLength;
+            for (let i = 0; i < len; i++) binary += String.fromCharCode(bytes[i]);
+            const base64 = btoa(binary);
+            const res = await ipcRenderer.invoke('save-bytes', {
+              dataBase64: base64,
+              defaultPath: 'mindmap.png',
+              mime: 'image/png'
+            });
+            if (!res?.ok) alert('저장 취소 또는 실패');
+          } else {
+            downloadBlobinPage(blob, 'mindmap.png');
+          }
+        }, 'image/png', 1.0);
+      };
+      img.onerror = () => { URL.revokeObjectURL(url); alert('SVG 이미지를 불러오지 못했습니다.'); };
+      img.src = url;
+    }
+
+    document.getElementById('mmSaveSVG').onclick = () => exportMindmapSVG();
+    document.getElementById('mmSavePNG').onclick = async () => {
+      const svgString = getMindmapSVGString();
+      if (!svgString) return alert('저장할 마인드맵이 없습니다.');
+
+      const res = await window.api.saveSvgAsPng({
+        svgString,
+        defaultPath: 'mindmap.png',
+        scale: 4, // 1=원본, 2~4로 올리면 고해상도
+      });
+      if (!res?.ok) alert('저장 취소 또는 실패');
+    };
+
 
     // ===== 어시스턴트 =====
     function renderChat(){
@@ -227,6 +463,38 @@
     delBtn.onclick = deleteNote;
     saveBtn.onclick = saveNote;
 
+    // ✅ AI 분석 버튼 동작
+    analyzeBtn.onclick = async () => {
+      const title = titleEl.value.trim() || 'Untitled';
+      const content = getContent();
+      if (!content.trim()) { statusEl.textContent = '분석할 내용이 없습니다.'; return; }
+      analyzeBtn.disabled = true; analyzeBtn.textContent = '분석 중…';
+      try {
+        const res = await fetch(`${API}/analyze`, {
+          method:'POST',
+          headers:{ 'Content-Type':'application/json' },
+          body: JSON.stringify({ title, content })
+        });
+        const text = await res.text();
+        let data = null;
+        try { data = JSON.parse(text); } catch {}
+        if (!res.ok) {
+          console.error('analyze 실패', res.status, text);
+          statusEl.textContent = `분석 실패(${res.status})`;
+          if (data) renderAnalysis(data);
+          return;
+        }
+        if (!data) { statusEl.textContent = '분석 실패 (빈 응답)'; return;}
+        renderAnalysis(data);
+        statusEl.textContent = '분석 완료';
+      } catch(e){
+        console.error(e);
+        statusEl.textContent = '분석 실패 (네트워크)';
+      } finally {
+        analyzeBtn.disabled = false; analyzeBtn.textContent = 'AI 분석';
+      }
+    };
+
     sendBtn.onclick = sendChat;
     clearChatBtn.onclick = () => { chatHistory=[]; renderChat(); };
     chatInputEl.addEventListener("keydown", e => { if (e.key === "Enter") sendChat(); });
@@ -237,7 +505,7 @@
       if ((e.ctrlKey||e.metaKey) && k === "n") { e.preventDefault(); createNote(); }
     });
 
-    // ===== Electron IPC (있으면 실시간 리스트 갱신) & 백업 폴링 =====
+    // ===== Electron IPC & 폴링 =====
     if (window.electronAPI?.onNotesChanged) {
       window.electronAPI.onNotesChanged(async () => {
         await fetchList();
@@ -248,7 +516,7 @@
 
     // ===== 초기 로딩 =====
     (async function init(){
-      initEditor();               // 먼저 에디터 생성
+      initEditor();
       await fetchList();
       if (notes[0]) await loadNote(notes[0].id);
       renderChat();
